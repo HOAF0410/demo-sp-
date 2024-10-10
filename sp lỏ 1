@@ -1,0 +1,183 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <SD.h>
+#include "driver/i2s.h"
+
+// Khai báo chân nút nhấn, SD card và LED
+#define BUTTON_PIN 33
+#define SD_CS 5
+#define LED_PIN 2
+
+// Khai báo thông tin kết nối WiFi
+const char* ssid = "vip1";
+const char* password = "123456789";
+
+// Tạo server trên cổng 80
+WebServer server(80);
+
+// Biến trạng thái
+bool isRecording = false;
+bool buttonPressed = false;
+File wavFile;
+String latestFileName = "/audio.wav"; // Chỉ lưu file mới nhất
+
+void i2s_install() {
+  i2s_config_t i2s_config = {
+    .mode = i2s_mode_t(I2S_MODE_MASTER | I2S_MODE_RX),
+    .sample_rate = 44100,
+    .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
+    .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
+    .communication_format = I2S_COMM_FORMAT_I2S_MSB,
+    .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
+    .dma_buf_count = 8,
+    .dma_buf_len = 64
+  };
+  
+  i2s_pin_config_t pin_config = {
+    .bck_io_num = 26,
+    .ws_io_num = 25,
+    .data_out_num = I2S_PIN_NO_CHANGE,
+    .data_in_num = 34
+  };
+  
+  i2s_driver_install(I2S_NUM_0, &i2s_config, 0, NULL);
+  i2s_set_pin(I2S_NUM_0, &pin_config);
+}
+
+void writeWAVHeader(File file, int sampleRate, int bitsPerSample, int channels, int dataSize) {
+  file.write((const uint8_t*)"RIFF", 4);
+  int fileSize = 36 + dataSize;
+  file.write((byte*)&fileSize, 4);
+  file.write((const uint8_t*)"WAVE", 4);
+
+  file.write((const uint8_t*)"fmt ", 4);
+  int16_t audioFormat = 1; // PCM = 1
+  int16_t numChannels = channels;
+  file.write((byte*)&audioFormat, 2);
+  file.write((byte*)&numChannels, 2);
+
+  file.write((byte*)&sampleRate, 4);
+  int32_t byteRate = sampleRate * channels * bitsPerSample / 8;
+  file.write((byte*)&byteRate, 4);
+
+  int16_t blockAlign = channels * bitsPerSample / 8;
+  file.write((byte*)&blockAlign, 2);
+  file.write((byte*)&bitsPerSample, 2);
+
+  file.write((const uint8_t*)"data", 4);
+  file.write((byte*)&dataSize, 4);
+}
+
+void startRecording() {
+  if (SD.exists(latestFileName)) {
+    SD.remove(latestFileName); // Xóa file cũ
+  }
+
+  wavFile = SD.open(latestFileName, FILE_WRITE);
+  writeWAVHeader(wavFile, 44100, 16, 1, 0); // Khởi tạo header WAV
+  isRecording = true;
+  digitalWrite(LED_PIN, HIGH); // Bật LED khi bắt đầu ghi âm
+  Serial.println("Recording started");
+}
+
+void stopRecording() {
+  if (isRecording) {
+    isRecording = false;
+    int dataSize = wavFile.size() - 44; // Trừ đi kích thước header
+    wavFile.seek(4); // Về đầu file để cập nhật file size
+    int fileSize = 36 + dataSize; // Kích thước file tổng
+    wavFile.write((byte*)&fileSize, 4);
+    
+    wavFile.seek(40); // Về vị trí kích thước dữ liệu
+    wavFile.write((byte*)&dataSize, 4);
+    
+    wavFile.close(); // Đóng file
+    digitalWrite(LED_PIN, LOW); // Tắt LED khi dừng ghi âm
+    Serial.println("Recording stopped");
+  }
+}
+
+void handleAudioDownload() {
+  File file = SD.open(latestFileName);
+  if (!file) {
+    server.send(404, "text/plain", "File not found");
+    return;
+  }
+  
+  server.streamFile(file, "audio/wav");
+  file.close();
+}
+
+void handleAudioStreaming() {
+  File file = SD.open(latestFileName);
+  if (!file) {
+    server.send(404, "text/plain", "File not found");
+    return;
+  }
+  
+  server.sendHeader("Content-Type", "audio/wav");
+  server.sendHeader("Connection", "close");
+  server.send(200);
+
+  // Đọc file và stream trực tiếp
+  uint8_t buffer[512];
+  while (file.available()) {
+    size_t bytesRead = file.read(buffer, sizeof(buffer));
+    server.client().write(buffer, bytesRead);
+  }
+  
+  file.close();
+}
+
+void setupWebServer() {
+  server.on("/audio.wav", handleAudioDownload);  // Endpoint tải file
+  server.on("/audio_stream", handleAudioStreaming);  // Endpoint phát trực tiếp
+  server.begin();
+  Serial.println("Web server started.");
+}
+
+void setup() {
+  Serial.begin(115200);
+  
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);
+
+  WiFi.softAP(ssid, password);
+  Serial.println("Access Point Started");
+  Serial.print("IP address: ");
+  Serial.println(WiFi.softAPIP());
+
+  if (!SD.begin(SD_CS)) {
+    Serial.println("SD card init failed!");
+    return;
+  }
+
+  i2s_install();
+  setupWebServer();
+}
+
+void loop() {
+  if (digitalRead(BUTTON_PIN) == LOW) {
+    if (!buttonPressed) {
+      buttonPressed = true;
+
+      if (isRecording) {
+        stopRecording();
+      } else {
+        startRecording();
+      }
+    }
+  } else {
+    buttonPressed = false;
+  }
+
+  if (isRecording) {
+    size_t bytesRead;
+    int16_t i2s_buffer[512];
+    i2s_read(I2S_NUM_0, i2s_buffer, sizeof(i2s_buffer), &bytesRead, portMAX_DELAY);
+    wavFile.write((byte*)i2s_buffer, bytesRead);
+  }
+
+  server.handleClient();
+}
